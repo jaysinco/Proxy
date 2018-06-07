@@ -20,7 +20,7 @@ func main() {
 	}
 	handle, ok := protocol[os.Args[1]]
 	if !ok {
-		fmt.Printf("unsupport proxy type: %s\n", os.Args[1])
+		fmt.Printf("unsupport protocol: '%s'\n", os.Args[1])
 		return
 	}
 	listener, err := net.Listen("tcp", os.Args[2])
@@ -39,11 +39,11 @@ func main() {
 
 func handleHTTP(conn net.Conn) {
 	closed := false
-	sysinfo <- clientConnect
+	info <- clientConnect
 	defer func() {
 		if !closed {
 			conn.Close()
-			sysinfo <- clientClose
+			info <- clientClose
 		}
 	}()
 	req, err := http.ReadRequest(bufio.NewReader(conn))
@@ -59,16 +59,16 @@ func handleHTTP(conn net.Conn) {
 		fmt.Fprint(conn, "HTTP/1.1 403 Host address looped\r\n\r\n")
 		return
 	}
-	remote, err := net.Dial("tcp", remoteAddr)
+	remote, err := net.DialTimeout("tcp", remoteAddr, 20*time.Second)
 	if err != nil {
 		fmt.Fprint(conn, "HTTP/1.1 404 Failed to connect host\r\n\r\n")
 		return
 	}
-	sysinfo <- remoteConnect
+	info <- remoteConnect
 	defer func() {
 		if !closed {
 			remote.Close()
-			sysinfo <- remoteClose
+			info <- remoteClose
 		}
 	}()
 	switch req.Method {
@@ -81,19 +81,24 @@ func handleHTTP(conn net.Conn) {
 			return
 		}
 	}
-	go func() {
-		copyThenClose(remote, conn)
-		sysinfo <- remoteClose
-	}()
-	copyThenClose(conn, remote)
-	sysinfo <- clientClose
+	signal := make(chan struct{})
+	go ncopy(remote, conn, signal)
+	go ncopy(conn, remote, signal)
+	<-signal
+	conn.Close()
+	remote.Close()
+	<-signal
+	info <- clientClose
+	info <- remoteClose
 	closed = true
 }
 
 var pool = &leakyBuf{4096, make(chan []byte, 2048)}
 
-func copyThenClose(dst, src net.Conn) {
-	defer dst.Close()
+func ncopy(dst, src net.Conn, signal chan struct{}) {
+	defer func() {
+		signal <- struct{}{}
+	}()
 	buf := pool.Get()
 	defer pool.Put(buf)
 	for {
@@ -132,12 +137,12 @@ func (l *leakyBuf) Put(b []byte) {
 	return
 }
 
-var sysinfo = make(chan sysmsg, 3)
+var info = make(chan cmsg, 3)
 
-type sysmsg int
+type cmsg int
 
 const (
-	clientConnect sysmsg = iota
+	clientConnect cmsg = iota
 	clientClose
 	remoteConnect
 	remoteClose
@@ -145,7 +150,7 @@ const (
 
 func collect() {
 	var ccon, rcon int
-	for msg := range sysinfo {
+	for msg := range info {
 		switch msg {
 		case clientConnect:
 			ccon++
