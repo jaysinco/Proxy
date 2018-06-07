@@ -15,7 +15,6 @@ func main() {
 		fmt.Println("Usage: proxy [protocol] [ip:port]")
 		return
 	}
-
 	protocol := map[string]func(net.Conn){
 		"http": handleHTTP,
 	}
@@ -24,13 +23,13 @@ func main() {
 		fmt.Printf("unsupport proxy type: %s\n", os.Args[1])
 		return
 	}
-
 	listener, err := net.Listen("tcp", os.Args[2])
 	if err != nil {
 		fmt.Printf("tcp listen: %v\n", err)
 		return
 	}
-	fmt.Printf("listening on %s...\n", os.Args[2])
+	fmt.Printf("listening on %s...", os.Args[2])
+	go collect()
 	for {
 		if conn, err := listener.Accept(); err == nil {
 			go handle(conn)
@@ -40,9 +39,11 @@ func main() {
 
 func handleHTTP(conn net.Conn) {
 	closed := false
+	sysinfo <- clientConnect
 	defer func() {
 		if !closed {
 			conn.Close()
+			sysinfo <- clientClose
 		}
 	}()
 	req, err := http.ReadRequest(bufio.NewReader(conn))
@@ -63,9 +64,11 @@ func handleHTTP(conn net.Conn) {
 		fmt.Fprint(conn, "HTTP/1.1 404 Failed to connect host\r\n\r\n")
 		return
 	}
+	sysinfo <- remoteConnect
 	defer func() {
 		if !closed {
 			remote.Close()
+			sysinfo <- remoteClose
 		}
 	}()
 	switch req.Method {
@@ -78,8 +81,12 @@ func handleHTTP(conn net.Conn) {
 			return
 		}
 	}
-	go copyThenClose(remote, conn)
+	go func() {
+		copyThenClose(remote, conn)
+		sysinfo <- remoteClose
+	}()
 	copyThenClose(conn, remote)
+	sysinfo <- clientClose
 	closed = true
 }
 
@@ -123,4 +130,33 @@ func (l *leakyBuf) Put(b []byte) {
 	default:
 	}
 	return
+}
+
+var sysinfo = make(chan sysmsg, 3)
+
+type sysmsg int
+
+const (
+	clientConnect sysmsg = iota
+	clientClose
+	remoteConnect
+	remoteClose
+)
+
+func collect() {
+	var ccon, rcon int
+	for msg := range sysinfo {
+		switch msg {
+		case clientConnect:
+			ccon++
+		case clientClose:
+			ccon--
+		case remoteConnect:
+			rcon++
+		case remoteClose:
+			rcon--
+		}
+		fmt.Printf("\r%s://%s/info?client=%d&remote=%d&leakybuf=%d/", os.Args[1], os.Args[2],
+			ccon, rcon, len(pool.free))
+	}
 }

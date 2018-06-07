@@ -11,5 +11,5 @@ go get -u github.com/jaysinco/proxy
 proxy -h
 Usage: proxy [protocol] [ip:port]
   current support protocol
-  - http: handle both http&https connection
+  - http: handle both http and https connection
 ```
