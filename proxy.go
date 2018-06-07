@@ -28,7 +28,7 @@ func main() {
 		fmt.Printf("tcp listen: %v\n", err)
 		return
 	}
-	fmt.Printf("listening on %s...", os.Args[2])
+	fmt.Printf("listening on %s://%s...", os.Args[1], os.Args[2])
 	go collect()
 	for {
 		if conn, err := listener.Accept(); err == nil {
@@ -161,7 +161,7 @@ func collect() {
 		case remoteClose:
 			rcon--
 		}
-		fmt.Printf("\r%s://%s/info?client=%d&remote=%d&leakybuf=%d/", os.Args[1], os.Args[2],
+		fmt.Printf("\rlistening on %s://%s/info?client=%d&remote=%d&leakybuf=%d...", os.Args[1], os.Args[2],
 			ccon, rcon, len(pool.free))
 	}
 }
