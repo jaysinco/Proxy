@@ -28,7 +28,6 @@ func main() {
 		fmt.Printf("tcp listen: %v\n", err)
 		return
 	}
-	fmt.Printf("listening on %s://%s...", os.Args[1], os.Args[2])
 	go collect()
 	for {
 		if conn, err := listener.Accept(); err == nil {
@@ -81,13 +80,13 @@ func handleHTTP(conn net.Conn) {
 			return
 		}
 	}
-	signal := make(chan struct{})
-	go ncopy(remote, conn, signal)
-	go ncopy(conn, remote, signal)
-	<-signal
+	finished := make(chan struct{})
+	go ncopy(remote, conn, finished)
+	go ncopy(conn, remote, finished)
+	<-finished
 	conn.Close()
 	remote.Close()
-	<-signal
+	<-finished
 	info <- clientClose
 	info <- remoteClose
 	closed = true
@@ -95,9 +94,9 @@ func handleHTTP(conn net.Conn) {
 
 var pool = &leakyBuf{4096, make(chan []byte, 2048)}
 
-func ncopy(dst, src net.Conn, signal chan struct{}) {
+func ncopy(dst, src net.Conn, finished chan struct{}) {
 	defer func() {
-		signal <- struct{}{}
+		finished <- struct{}{}
 	}()
 	buf := pool.Get()
 	defer pool.Put(buf)
@@ -137,18 +136,19 @@ func (l *leakyBuf) Put(b []byte) {
 	return
 }
 
-var info = make(chan cmsg, 3)
+var info = make(chan message, 3)
 
-type cmsg int
+type message int
 
 const (
-	clientConnect cmsg = iota
+	clientConnect message = iota
 	clientClose
 	remoteConnect
 	remoteClose
 )
 
 func collect() {
+	fmt.Printf("listening on %s://%s/info?connect=0v0...", os.Args[1], os.Args[2])
 	var ccon, rcon int
 	for msg := range info {
 		switch msg {
@@ -161,7 +161,6 @@ func collect() {
 		case remoteClose:
 			rcon--
 		}
-		fmt.Printf("\rlistening on %s://%s/info?client=%d&remote=%d&leakybuf=%d...", os.Args[1], os.Args[2],
-			ccon, rcon, len(pool.free))
+		fmt.Printf("\rlistening on %s://%s/info?connect=%dv%d.", os.Args[1], os.Args[2], ccon, rcon)
 	}
 }
