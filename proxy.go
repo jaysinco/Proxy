@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,7 +19,8 @@ func main() {
 		return
 	}
 	protocol := map[string]func(net.Conn){
-		"http": handleHTTP,
+		"http":   handleHTTP,
+		"socks5": handleSocks5,
 	}
 	handle, ok := protocol[os.Args[1]]
 	if !ok {
@@ -28,12 +32,124 @@ func main() {
 		fmt.Printf("tcp listen: %v\n", err)
 		return
 	}
-	go collect()
+	fmt.Printf("listening on %s://%s...\n", os.Args[1], os.Args[2])
+	go countTCP()
 	for {
 		if conn, err := listener.Accept(); err == nil {
 			go handle(conn)
 		}
 	}
+}
+func handleSocks5(conn net.Conn) {
+	closed := false
+	info <- clientConnect
+	defer func() {
+		if !closed {
+			conn.Close()
+			info <- clientClose
+		}
+	}()
+	if err := handshake(conn); err != nil {
+		return
+	}
+	remoteAddr, err := getRemoteAddr(conn)
+	if err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x68, 0x68}); err != nil {
+		return
+	}
+	remote, err := net.DialTimeout("tcp", remoteAddr, 20*time.Second)
+	if err != nil {
+		return
+	}
+	info <- remoteConnect
+	defer func() {
+		if !closed {
+			remote.Close()
+			info <- remoteClose
+		}
+	}()
+	done := make(chan struct{})
+	go ncopy(remote, conn, done)
+	go ncopy(conn, remote, done)
+	<-done
+	conn.Close()
+	remote.Close()
+	<-done
+	info <- clientClose
+	info <- remoteClose
+	closed = true
+}
+
+func getRemoteAddr(conn net.Conn) (string, error) {
+	buf := make([]byte, 262)
+	n, err := io.ReadAtLeast(conn, buf, 5)
+	if err != nil {
+		return "", fmt.Errorf("failed to read five two bytes")
+	}
+	if buf[0] != 0x05 {
+		return "", fmt.Errorf("wrong socks verion")
+	}
+	if buf[1] != 0x01 {
+		return "", fmt.Errorf("only support command 'connect'")
+	}
+	mlen := -1
+	switch buf[3] {
+	case 0x01:
+		mlen = 4 + net.IPv4len + 2
+	case 0x03:
+		mlen = 4 + 1 + int(buf[4]) + 2
+	case 0x04:
+		mlen = 4 + net.IPv6len + 2
+	default:
+		return "", fmt.Errorf("wrong remote address type")
+	}
+	switch {
+	case n > mlen:
+		return "", fmt.Errorf("more bytes than expected")
+	case n < mlen:
+		if _, err = io.ReadFull(conn, buf[n:mlen]); err != nil {
+			return "", fmt.Errorf("read rest: %v", err)
+		}
+	}
+	host := ""
+	switch buf[3] {
+	case 0x01:
+		host = net.IP(buf[4 : 4+net.IPv4len]).String()
+	case 0x03:
+		host = string(buf[5 : 5+int(buf[4])])
+	case 0x04:
+		host = net.IP(buf[4 : 4+net.IPv6len]).String()
+	}
+	port := binary.BigEndian.Uint16(buf[mlen-2 : mlen])
+	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	return host, nil
+}
+
+func handshake(conn net.Conn) error {
+	buf := make([]byte, 257)
+	n, err := io.ReadAtLeast(conn, buf, 2)
+	if err != nil {
+		return fmt.Errorf("failed to read first two bytes")
+	}
+	if buf[0] != 0x05 {
+		return fmt.Errorf("wrong socks verion")
+	}
+	nmethods := int(buf[1])
+	mlen := nmethods + 2
+	switch {
+	case n > mlen:
+		return fmt.Errorf("more bytes than expected")
+	case n < mlen:
+		if _, err = io.ReadFull(conn, buf[n:mlen]); err != nil {
+			return fmt.Errorf("read rest: %v", err)
+		}
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return fmt.Errorf("reply: %v", err)
+	}
+	return nil
 }
 
 func handleHTTP(conn net.Conn) {
@@ -80,13 +196,13 @@ func handleHTTP(conn net.Conn) {
 			return
 		}
 	}
-	finished := make(chan struct{})
-	go ncopy(remote, conn, finished)
-	go ncopy(conn, remote, finished)
-	<-finished
+	done := make(chan struct{})
+	go ncopy(remote, conn, done)
+	go ncopy(conn, remote, done)
+	<-done
 	conn.Close()
 	remote.Close()
-	<-finished
+	<-done
 	info <- clientClose
 	info <- remoteClose
 	closed = true
@@ -94,9 +210,9 @@ func handleHTTP(conn net.Conn) {
 
 var pool = &leakyBuf{4096, make(chan []byte, 2048)}
 
-func ncopy(dst, src net.Conn, finished chan struct{}) {
+func ncopy(dst, src net.Conn, done chan struct{}) {
 	defer func() {
-		finished <- struct{}{}
+		done <- struct{}{}
 	}()
 	buf := pool.Get()
 	defer pool.Put(buf)
@@ -136,19 +252,19 @@ func (l *leakyBuf) Put(b []byte) {
 	return
 }
 
-var info = make(chan message, 3)
+var info = make(chan cmsg, 3)
 
-type message int
+type cmsg int
 
 const (
-	clientConnect message = iota
+	clientConnect cmsg = iota
 	clientClose
 	remoteConnect
 	remoteClose
 )
 
-func collect() {
-	fmt.Printf("listening on %s://%s/info?connect=0v0...", os.Args[1], os.Args[2])
+func countTCP() {
+	fmt.Printf("current connected TCP: %-6d", 0)
 	var ccon, rcon int
 	for msg := range info {
 		switch msg {
@@ -161,6 +277,6 @@ func collect() {
 		case remoteClose:
 			rcon--
 		}
-		fmt.Printf("\rlistening on %s://%s/info?connect=%dv%d.", os.Args[1], os.Args[2], ccon, rcon)
+		fmt.Printf("\rcurrent connected TCP: %-6d", ccon+rcon)
 	}
 }
